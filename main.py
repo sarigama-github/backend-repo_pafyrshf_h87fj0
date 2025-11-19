@@ -2,7 +2,7 @@ import os
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 
 from database import db, create_document, get_documents
@@ -135,6 +135,109 @@ def list_leads(limit: Optional[int] = 20):
         return {"items": docs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+# -----------------------------
+# Nettolohn-Berechnung (CH/FL)
+# -----------------------------
+class NetCalcRequest(BaseModel):
+    gross_chf: float = Field(..., gt=0, description="Bruttolohn in CHF/Monat")
+    work_ch: str = Field(..., description="Arbeitsort: Kanton in CH oder Liechtenstein")
+    residence_at: str = Field(..., description="Wohnsitz in Österreich (Bundesland)")
+    age: Optional[int] = Field(None, ge=16, le=70)
+    marital: Optional[str] = Field("single", description="single|married")
+    children_count: Optional[int] = Field(0, ge=0, le=10)
+    exchange_rate: Optional[float] = Field(0.95, gt=0, description="CHF→EUR Kurs")
+
+class NetCalcResult(BaseModel):
+    net_chf: float
+    net_eur: float
+    total_deductions: float
+    breakdown: dict
+    assumptions: dict
+
+
+def estimate_bvg_rate(age: Optional[int]) -> float:
+    # Very rough guideline by age band
+    if age is None:
+        return 0.07
+    if age < 25:
+        return 0.05
+    if age < 35:
+        return 0.07
+    if age < 45:
+        return 0.09
+    if age < 55:
+        return 0.11
+    return 0.12
+
+
+def estimate_quellensteuer_rate(work_ch_lower: str, marital: str, children_count: int) -> float:
+    # Simplified non-resident withholding tax heuristic by canton
+    base = 0.02  # default 2%
+    if any(k in work_ch_lower for k in ["zh", "zürich", "zuerich"]):
+        base = 0.045
+    elif any(k in work_ch_lower for k in ["bs", "basel"]):
+        base = 0.043
+    elif any(k in work_ch_lower for k in ["ge", "genf"]):
+        base = 0.05
+    elif "liechtenstein" in work_ch_lower or work_ch_lower.strip() in ["fl", "li"]:
+        base = 0.012  # FL: andere Logik – hier konservativ klein
+
+    # Family relief (very rough): married -0.4pp, each kid -0.2pp (down to 0)
+    relief = (0.004 if marital == "married" else 0.0) + 0.002 * min(3, children_count)
+    return max(0.0, base - relief)
+
+
+@app.post("/api/calc/net", response_model=NetCalcResult)
+def calc_net(req: NetCalcRequest):
+    try:
+        gross = float(req.gross_chf)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid gross_chf")
+
+    work = (req.work_ch or "").lower().strip()
+
+    # Social security (employee part) – very rough, monthly
+    ahv_iv_eo = gross * 0.053  # 5.3%
+    alv = min(gross, 148200/12) * 0.011  # 1.1% up to cap
+    nbu = gross * 0.011  # Non-occupational accident
+    bvg = gross * estimate_bvg_rate(req.age)  # pension, age-dependent
+
+    # Health insurance is not deducted from payroll in CH, but show budget hint (optional)
+    health_hint = 0.0
+
+    # Quellensteuer (if applicable)
+    qs_rate = estimate_quellensteuer_rate(work, req.marital or "single", int(req.children_count or 0))
+    quellensteuer = gross * qs_rate
+
+    deductions = {
+        "AHV/IV/EO": round(ahv_iv_eo, 2),
+        "ALV": round(alv, 2),
+        "NBU": round(nbu, 2),
+        "BVG (Pension)": round(bvg, 2),
+        "Quellensteuer (vereinfachte Schätzung)": round(quellensteuer, 2),
+        "Krankenkasse (Hinweis, nicht Lohnabzug)": round(health_hint, 2),
+    }
+
+    total_deductions = sum([ahv_iv_eo, alv, nbu, bvg, quellensteuer])
+    net_chf = max(0.0, gross - total_deductions)
+    net_eur = net_chf * float(req.exchange_rate or 0.95)
+
+    assumptions = {
+        "exchange_rate": req.exchange_rate,
+        "bvg_rate": round(estimate_bvg_rate(req.age), 3),
+        "qs_rate": round(qs_rate, 3),
+        "disclaimer": "Unverbindliche Richtwerte. Individuelle Situation (Kasse, Alter, BVG-Plan, Steuerstatus) kann stark abweichen.",
+    }
+
+    return NetCalcResult(
+        net_chf=round(net_chf, 2),
+        net_eur=round(net_eur, 2),
+        total_deductions=round(total_deductions, 2),
+        breakdown=deductions,
+        assumptions=assumptions,
+    )
 
 
 if __name__ == "__main__":
